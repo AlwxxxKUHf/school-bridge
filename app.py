@@ -1,14 +1,15 @@
-from flask import Flask, request, jsonify, session, render_template_string, redirect
-from flask_socketio import SocketIO
+import random  
+import os
+import logging
+import json
 import sqlite3
 import threading
 import time
-import logging
-import json
-from datetime import datetime, timedelta
 import uuid
+from datetime import datetime, timedelta
 from collections import defaultdict
-import os
+from flask import Flask, request, jsonify, session, render_template_string, redirect
+from flask_socketio import SocketIO
 
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', 'school-secret-2024')
@@ -491,7 +492,6 @@ def login_http():
         return render_login_page(error=True, message=result.get('message', 'Ошибка'))
 
 if __name__ == '__main__':
-    import random
     port = int(os.environ.get('PORT', 5001))
     logging.info(f"Starting server on port {port}")
     socketio.run(app, host='0.0.0.0', port=port, debug=False)
