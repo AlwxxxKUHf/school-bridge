@@ -1,4 +1,4 @@
-import random  
+import random
 import os
 import logging
 import json
@@ -405,6 +405,17 @@ def add_journal_entry():
     result = pi_manager.send_command(pi_id, 'add_journal_entry', data)
     return jsonify(result)
 
+@app.route('/api/status')
+def get_status():
+    pi_id = 'default_pi'
+    is_connected = pi_id in pi_manager.connections
+    
+    return jsonify({
+        'status': 'success',
+        'raspberry_pi_connected': is_connected,
+        'connected_at': pi_manager.last_heartbeat.get(pi_id) if is_connected else None
+    })
+
 @app.route('/health')
 def health():
     pi_status = "connected" if pi_manager.connections else "disconnected"
@@ -416,20 +427,59 @@ def health():
         'timestamp': datetime.now().isoformat()
     })
 
-# HTML шаблоны (упрощенные для примера)
+# HTML шаблоны
 def render_login_page(error=False, message=""):
-    return f'''
+    return '''
     <!DOCTYPE html>
     <html>
-    <head><title>Login</title></head>
+    <head>
+        <title>Вход в систему</title>
+        <style>
+            body { font-family: Arial, sans-serif; max-width: 400px; margin: 100px auto; padding: 20px; }
+            .login-form { border: 1px solid #ddd; padding: 20px; border-radius: 5px; }
+            input { width: 100%; padding: 10px; margin: 10px 0; border: 1px solid #ccc; border-radius: 3px; }
+            button { width: 100%; padding: 10px; background: #007cba; color: white; border: none; border-radius: 3px; cursor: pointer; }
+            .error { color: red; margin-top: 10px; }
+            .status { margin: 10px 0; padding: 10px; border-radius: 3px; }
+            .connected { background: #d4edda; color: #155724; }
+            .disconnected { background: #f8d7da; color: #721c24; }
+        </style>
+        <script>
+            function checkRaspberryStatus() {
+                fetch('/api/status')
+                    .then(response => response.json())
+                    .then(data => {
+                        const statusDiv = document.getElementById('raspberry-status');
+                        if (data.raspberry_pi_connected) {
+                            statusDiv.innerHTML = '<div class="status connected">✅ Raspberry Pi подключен</div>';
+                        } else {
+                            statusDiv.innerHTML = '<div class="status disconnected">❌ Raspberry Pi не подключен</div>';
+                        }
+                    })
+                    .catch(error => {
+                        document.getElementById('raspberry-status').innerHTML = 
+                            '<div class="status disconnected">❌ Ошибка проверки статуса</div>';
+                    });
+            }
+            
+            // Проверяем статус при загрузке страницы и каждые 10 секунд
+            document.addEventListener('DOMContentLoaded', function() {
+                checkRaspberryStatus();
+                setInterval(checkRaspberryStatus, 10000);
+            });
+        </script>
+    </head>
     <body>
-        <h2>Вход в систему</h2>
-        <form method="POST" action="/login">
-            <input name="teacher_id" placeholder="ID" value="teacher_001" required>
-            <input name="password" type="password" placeholder="Пароль" value="123456" required>
-            <button type="submit">Войти</button>
-        </form>
-        {f'<p style="color:red">{message}</p>' if error else ''}
+        <div class="login-form">
+            <h2>Вход в систему</h2>
+            <div id="raspberry-status"></div>
+            <form method="POST" action="/login">
+                <input name="teacher_id" placeholder="ID преподавателя" required>
+                <input name="password" type="password" placeholder="Пароль" required>
+                <button type="submit">Войти</button>
+            </form>
+            ''' + (f'<div class="error">{message}</div>' if error else '') + '''
+        </div>
     </body>
     </html>
     '''
@@ -438,20 +488,42 @@ def render_dashboard(teacher_name, is_admin, teacher_id):
     return f'''
     <!DOCTYPE html>
     <html>
-    <head><title>Dashboard</title></head>
+    <head>
+        <title>Панель преподавателя</title>
+        <style>
+            body {{ font-family: Arial, sans-serif; margin: 20px; }}
+            .header {{ background: #f8f9fa; padding: 20px; border-radius: 5px; margin-bottom: 20px; }}
+            .groups-section {{ border: 1px solid #ddd; padding: 20px; border-radius: 5px; }}
+        </style>
+    </head>
     <body>
-        <h1>Панель преподавателя</h1>
-        <p>Добро пожаловать, {teacher_name}!</p>
-        <div id="groups-list">Загрузка групп...</div>
-        <button onclick="loadGroups()">Обновить группы</button>
+        <div class="header">
+            <h1>Панель преподавателя</h1>
+            <p>Добро пожаловать, {teacher_name}!</p>
+            <p>ID: {teacher_id}</p>
+            <p>Роль: {"Администратор" if is_admin else "Преподаватель"}</p>
+        </div>
+        
+        <div class="groups-section">
+            <h3>Группы студентов</h3>
+            <div id="groups-list">Загрузка групп...</div>
+            <button onclick="loadGroups()">Обновить группы</button>
+        </div>
+
         <script>
             function loadGroups() {{
                 fetch('/api/groups')
                     .then(r => r.json())
                     .then(data => {{
                         if(data.status === 'success') {{
-                            document.getElementById('groups-list').innerHTML = 
-                                'Группы: ' + data.data.map(g => g.name).join(', ');
+                            const groupsHtml = data.data.map(g => 
+                                `<div style="padding: 10px; margin: 5px; background: #f0f0f0; border-radius: 3px;">
+                                    {g.name}
+                                </div>`
+                            ).join('');
+                            document.getElementById('groups-list').innerHTML = groupsHtml;
+                        }} else {{
+                            document.getElementById('groups-list').innerHTML = 'Ошибка загрузки групп';
                         }}
                     }});
             }}
@@ -489,7 +561,7 @@ def login_http():
         session['is_admin'] = teacher_data['role'] == 'admin'
         return redirect('/')
     else:
-        return render_login_page(error=True, message=result.get('message', 'Ошибка'))
+        return render_login_page(error=True, message=result.get('message', 'Ошибка входа'))
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5001))
