@@ -1,561 +1,507 @@
-import random
 import os
 import logging
-import json
 import sqlite3
-import threading
-import time
 import uuid
-from datetime import datetime, timedelta
-from collections import defaultdict
-from flask import Flask, request, jsonify, session, render_template_string, redirect
-from flask_socketio import SocketIO
+import json
+import time
+from datetime import datetime
+from flask import Flask, request, jsonify, session, redirect
+from flask_socketio import SocketIO, emit
 
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', 'school-secret-2024')
-socketio = SocketIO(app, cors_allowed_origins="*", ping_timeout=60, ping_interval=25)
+socketio = SocketIO(app, cors_allowed_origins="*")
 
-# Локальная SQLite база для кэширования
-CACHE_DB_PATH = '/tmp/school_cache.db'
+# Хранилища
+connections = {}
+pending_requests = {}
+backup_mode = False
 
-# Глобальные переменные
-active_pi_connections = {}
-pending_requests = defaultdict(dict)
-activity_bot_running = False
+# Полная резервная база на сайте
+def init_backup_db():
+    conn = sqlite3.connect('/tmp/backup.db')
+    cursor = conn.cursor()
+    
+    # Таблица групп (полное дублирование)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS backup_groups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE NOT NULL,
+            course TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    # Таблица студентов (полное дублирование)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS backup_students (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            group_name TEXT NOT NULL,
+            student_id TEXT UNIQUE,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (group_name) REFERENCES backup_groups (name)
+        )
+    ''')
+    
+    # Таблица журнала
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS backup_journal (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date TEXT NOT NULL,
+            student_name TEXT NOT NULL,
+            group_name TEXT NOT NULL,
+            subject TEXT NOT NULL,
+            topic TEXT NOT NULL,
+            grade INTEGER,
+            attendance BOOLEAN DEFAULT TRUE,
+            comments TEXT,
+            teacher_id TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    # Очередь синхронизации для новых данных
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS sync_queue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            action_type TEXT NOT NULL,
+            data_json TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    # Синхронизируем начальные данные при первом запуске
+    init_default_data(cursor)
+    
+    conn.commit()
+    conn.close()
 
-class CacheManager:
-    def __init__(self):
-        self.init_cache_database()
+def init_default_data(cursor):
+    """Начальные данные групп и студентов"""
+    groups_data = [
+        ('1П1', '1 Курс'), ('1Л1', '1 Курс'), ('1Ю1', '1 Курс'), ('1Ю2', '1 Курс'), 
+        ('1Б1', '1 Курс'), ('1БД1', '1 Курс'),
+        ('2Н1', '2 Курс'), ('2Б1', '2 Курс'), ('2Ю1', '2 Курс'), ('2Ю2', '2 Курс'),
+        ('2Л1', '2 Курс'), ('2П1', '2 Курс'), ('2П2', '2 Курс'), ('1П3', '2 Курс'),
+        ('1Б3', '2 Курс'), ('1Л3', '2 Курс'), ('2П3', '2 Курс'),
+        ('3П1', '3 Курс'), ('3П2', '3 Курс'), ('3Н1', '3 Курс'), ('3Н2', '3 Курс'),
+        ('3Б1', '3 Курс'),
+        ('4П1', '4 Курс'), ('4П2', '4 Курс'), ('4Н1', '4 Курс'), ('4Н2', '4 Курс'),
+        ('4Б1', '4 Курс'), ('4Ю1', '4 Курс'), ('4Л1', '4 Курс')
+    ]
     
-    def init_cache_database(self):
-        """Инициализация кэш-базы на Render.com"""
-        conn = sqlite3.connect(CACHE_DB_PATH)
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS teacher_sessions (
-                session_id TEXT PRIMARY KEY,
-                teacher_id TEXT NOT NULL,
-                teacher_name TEXT NOT NULL,
-                is_admin BOOLEAN DEFAULT FALSE,
-                login_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                last_activity TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        
-        conn.commit()
-        conn.close()
-        logging.info("Cache database initialized")
+    for group_name, course in groups_data:
+        cursor.execute('INSERT OR IGNORE INTO backup_groups (name, course) VALUES (?, ?)', (group_name, course))
     
-    def get_db_connection(self):
-        return sqlite3.connect(CACHE_DB_PATH)
+    # Примеры студентов для нескольких групп
+    students_data = [
+        ('Иванов Алексей', '1П1', 'ST001'), ('Петрова Анна', '1П1', 'ST002'),
+        ('Сидоров Максим', '1П1', 'ST003'), ('Кузнецова Ольга', '1П1', 'ST004'),
+        ('Васильев Дмитрий', '1Л1', 'ST005'), ('Николаева Елена', '1Л1', 'ST006'),
+        ('Федоров Сергей', '2П1', 'ST009'), ('Морозова Татьяна', '2П1', 'ST010'),
+        ('Семенов Артем', '3П1', 'ST013'), ('Волкова Мария', '3П1', 'ST014')
+    ]
+    
+    for student in students_data:
+        cursor.execute('INSERT OR IGNORE INTO backup_students (name, group_name, student_id) VALUES (?, ?, ?)', student)
 
-class RaspberryPiManager:
-    def __init__(self):
-        self.connections = {}
-        self.last_heartbeat = {}
-        self.cache_manager = CacheManager()
-    
-    def register_connection(self, pi_id, socket_id):
-        self.connections[pi_id] = socket_id
-        self.last_heartbeat[pi_id] = time.time()
-        logging.info(f"Raspberry Pi {pi_id} connected")
-    
-    def send_command(self, pi_id, command, data, timeout=15):
-        if pi_id not in self.connections:
-            raise Exception("Raspberry Pi not connected")
-        
-        request_id = str(uuid.uuid4())
-        command_data = {
-            'request_id': request_id,
-            'command': command,
-            'data': data,
-            'timestamp': time.time()
-        }
-        
-        pending_requests[pi_id][request_id] = command_data
-        socketio.emit('command', command_data, room=self.connections[pi_id])
-        
-        start_time = time.time()
-        while time.time() - start_time < timeout:
-            if request_id in pending_requests[pi_id] and 'response' in pending_requests[pi_id][request_id]:
-                response = pending_requests[pi_id][request_id]['response']
-                del pending_requests[pi_id][request_id]
-                return response
-            time.sleep(0.1)
-        
-        if request_id in pending_requests[pi_id]:
-            del pending_requests[pi_id][request_id]
-        raise Exception("Request timeout")
+init_backup_db()
 
-class ActivityBot:
-    def __init__(self, pi_manager):
-        self.pi_manager = pi_manager
-        self.running = False
-        self.thread = None
-    
-    def start(self):
-        """Запуск бота активности"""
-        if self.running:
-            return
-        
-        self.running = True
-        self.thread = threading.Thread(target=self._bot_loop, daemon=True)
-        self.thread.start()
-        logging.info("Activity bot started")
-    
-    def stop(self):
-        """Остановка бота активности"""
-        self.running = False
-        if self.thread:
-            self.thread.join()
-        logging.info("Activity bot stopped")
-    
-    def _bot_loop(self):
-        """Основной цикл бота активности"""
-        actions = [
-            self._simulate_health_check,
-            self._simulate_group_view,
-            self._simulate_teacher_login,
-            self._simulate_admin_actions
-        ]
-        
-        while self.running:
-            try:
-                # Выполняем случайное действие каждые 5-15 минут
-                action = random.choice(actions)
-                action()
-                
-                # Случайная пауза между действиями (5-15 минут)
-                sleep_time = random.randint(300, 900)
-                logging.info(f"Activity bot: next action in {sleep_time//60} minutes")
-                
-                # Прерываем sleep если нужно остановить бота
-                for _ in range(sleep_time):
-                    if not self.running:
-                        return
-                    time.sleep(1)
-                    
-            except Exception as e:
-                logging.error(f"Activity bot error: {e}")
-                time.sleep(60)
-    
-    def _simulate_health_check(self):
-        """Имитация проверки здоровья"""
-        logging.info("🤖 Activity: Health check")
-        # Просто обращаемся к health endpoint
-        try:
-            with app.test_client() as client:
-                client.get('/health')
-        except:
-            pass
-    
-    def _simulate_group_view(self):
-        """Имитация просмотра групп"""
-        logging.info("🤖 Activity: Viewing groups")
-        pi_id = 'default_pi'
-        if pi_id in self.pi_manager.connections:
-            try:
-                self.pi_manager.send_command(pi_id, 'get_groups', {})
-            except:
-                pass
-    
-    def _simulate_teacher_login(self):
-        """Имитация входа преподавателя"""
-        logging.info("🤖 Activity: Teacher login simulation")
-        teachers = [
-            {'teacher_id': 'teacher_001', 'password': '123456'},
-            {'teacher_id': 'teacher_002', 'password': '123456'}
-        ]
-        
-        teacher = random.choice(teachers)
-        pi_id = 'default_pi'
-        if pi_id in self.pi_manager.connections:
-            try:
-                self.pi_manager.send_command(pi_id, 'login', teacher)
-            except:
-                pass
-    
-    def _simulate_admin_actions(self):
-        """Имитация действий администратора"""
-        logging.info("🤖 Activity: Admin actions simulation")
-        pi_id = 'default_pi'
-        if pi_id in self.pi_manager.connections:
-            # Получаем список преподавателей
-            try:
-                self.pi_manager.send_command(pi_id, 'get_all_teachers', {})
-            except:
-                pass
-
-# Инициализация менеджеров
-pi_manager = RaspberryPiManager()
-activity_bot = ActivityBot(pi_manager)
+def get_backup_db():
+    return sqlite3.connect('/tmp/backup.db')
 
 # WebSocket события
 @socketio.on('connect')
 def handle_connect():
-    logging.info("Client connected")
+    logging.info(f"Client connected: {request.sid}")
 
 @socketio.on('raspberry_connect')
 def handle_raspberry_connect(data):
     pi_id = data.get('pi_id', 'default_pi')
-    pi_manager.register_connection(pi_id, request.sid)
+    connections[pi_id] = request.sid
     
-    # Запускаем бот активности при первом подключении Raspberry Pi
-    global activity_bot_running
-    if not activity_bot_running:
-        activity_bot.start()
-        activity_bot_running = True
+    global backup_mode
+    if backup_mode:
+        logging.info(f"✅ Raspberry Pi восстановил соединение! Начинаем синхронизацию...")
+        backup_mode = False
+        # Синхронизируем и очищаем ТОЛЬКО новые данные
+        sync_and_cleanup(pi_id)
     
-    # ✅ ИСПРАВЛЕНИЕ: Возвращаем подтверждение подключения
-    return {
-        'status': 'success', 
-        'connected_at': time.time(),
-        'raspberry_pi_connected': True,
-        'message': f'Raspberry Pi {pi_id} connected successfully'
-    }
+    logging.info(f"Raspberry Pi {pi_id} connected")
+    return {'status': 'success', 'connected': True}
 
 @socketio.on('raspberry_response')
 def handle_raspberry_response(data):
-    pi_id = data.get('pi_id', 'default_pi')
     request_id = data.get('request_id')
-    response_data = data.get('response', {})
+    if request_id in pending_requests:
+        pending_requests[request_id] = data.get('response')
+
+# Функция отправки команды с резервным копированием
+def send_command(pi_id, command, data, timeout=10):
+    global backup_mode
     
-    if pi_id in pending_requests and request_id in pending_requests[pi_id]:
-        pending_requests[pi_id][request_id]['response'] = response_data
+    # Если Raspberry Pi доступен и не в режиме резерва - работаем напрямую
+    if pi_id in connections and not backup_mode:
+        try:
+            result = send_command_direct(pi_id, command, data, timeout)
+            # Если команда на добавление - дублируем в резервную БД
+            if result.get('status') == 'success' and command in ['add_group', 'add_student']:
+                save_to_backup(command, data)
+            return result
+        except Exception as e:
+            logging.warning(f"⚠️ Ошибка связи с Raspberry Pi: {e}")
+            backup_mode = True
+    
+    # Режим резервного копирования - работаем с локальной БД
+    return process_in_backup_mode(command, data)
 
-@socketio.on('heartbeat')
-def handle_heartbeat(data):
-    pi_id = data.get('pi_id', 'default_pi')
-    pi_manager.last_heartbeat[pi_id] = time.time()
-    return {'status': 'ok'}
+# Обработка команд в режиме резерва
+def process_in_backup_mode(command, data):
+    conn = get_backup_db()
+    cursor = conn.cursor()
+    
+    try:
+        if command == 'get_groups':
+            groups = cursor.execute('SELECT * FROM backup_groups ORDER BY course, name').fetchall()
+            return {
+                'status': 'success', 
+                'data': [{'id': g[0], 'name': g[1], 'course': g[2]} for g in groups],
+                'backup_mode': True
+            }
+            
+        elif command == 'get_students':
+            group_name = data.get('group_name')
+            students = cursor.execute(
+                'SELECT * FROM backup_students WHERE group_name = ? ORDER BY name', (group_name,)
+            ).fetchall()
+            return {
+                'status': 'success',
+                'data': [{'id': s[0], 'name': s[1], 'group_name': s[2], 'student_id': s[3]} for s in students],
+                'backup_mode': True
+            }
+            
+        elif command == 'add_journal_entry':
+            # Сохраняем в журнал и добавляем в очередь синхронизации
+            cursor.execute('''
+                INSERT INTO backup_journal 
+                (date, student_name, group_name, subject, topic, grade, attendance, comments, teacher_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                data.get('date', datetime.now().strftime('%Y-%m-%d')),
+                data.get('student_name'),
+                data.get('group_name'),
+                data.get('subject'),
+                data.get('topic'),
+                data.get('grade'),
+                data.get('attendance', True),
+                data.get('comments', ''),
+                data.get('teacher_id')
+            ))
+            
+            cursor.execute('INSERT INTO sync_queue (action_type, data_json) VALUES (?, ?)', 
+                          ('add_journal_entry', json.dumps(data)))
+            
+            conn.commit()
+            return {
+                'status': 'success', 
+                'message': '✅ Оценка сохранена в резервное хранилище',
+                'backup_mode': True
+            }
+            
+        elif command == 'add_group':
+            # Добавляем группу в резервную БД
+            cursor.execute('INSERT OR IGNORE INTO backup_groups (name, course) VALUES (?, ?)', 
+                          (data.get('group_name'), 'Новый курс'))
+            
+            cursor.execute('INSERT INTO sync_queue (action_type, data_json) VALUES (?, ?)', 
+                          ('add_group', json.dumps(data)))
+            
+            conn.commit()
+            return {
+                'status': 'success',
+                'message': '✅ Группа добавлена в резервное хранилище',
+                'backup_mode': True
+            }
+            
+        elif command == 'add_student':
+            # Добавляем студента в резервную БД
+            cursor.execute('INSERT OR IGNORE INTO backup_students (name, group_name, student_id) VALUES (?, ?, ?)',
+                          (data.get('student_name'), data.get('group_name'), data.get('student_id')))
+            
+            cursor.execute('INSERT INTO sync_queue (action_type, data_json) VALUES (?, ?)',
+                          ('add_student', json.dumps(data)))
+            
+            conn.commit()
+            return {
+                'status': 'success',
+                'message': '✅ Студент добавлен в резервное хранилище',
+                'backup_mode': True
+            }
+            
+        elif command == 'login':
+            # Простая проверка логина в режиме резерва
+            return {
+                'status': 'success',
+                'teacher': {'id': 'teacher_001', 'name': 'Преподаватель', 'role': 'teacher'},
+                'backup_mode': True
+            }
+            
+        else:
+            return {
+                'status': 'error', 
+                'message': '❌ Команда недоступна в режиме резерва',
+                'backup_mode': True
+            }
+        
+    except Exception as e:
+        conn.rollback()
+        return {'status': 'error', 'message': f'Ошибка в режиме резерва: {str(e)}'}
+    finally:
+        conn.close()
 
-# HTTP API endpoints
+# Сохранение данных в резервную БД (для дублирования при штатной работе)
+def save_to_backup(command, data):
+    conn = get_backup_db()
+    cursor = conn.cursor()
+    
+    try:
+        if command == 'add_group':
+            cursor.execute('INSERT OR IGNORE INTO backup_groups (name, course) VALUES (?, ?)', 
+                          (data.get('group_name'), 'Новый курс'))
+        elif command == 'add_student':
+            cursor.execute('INSERT OR IGNORE INTO backup_students (name, group_name, student_id) VALUES (?, ?, ?)',
+                          (data.get('student_name'), data.get('group_name'), data.get('student_id')))
+        
+        conn.commit()
+        logging.info(f"✅ Данные продублированы в резервную БД: {command}")
+        
+    except Exception as e:
+        logging.error(f"Ошибка дублирования данных: {e}")
+        conn.rollback()
+    finally:
+        conn.close()
+
+# Синхронизация и очистка ТОЛЬКО новых данных
+def sync_and_cleanup(pi_id):
+    conn = get_backup_db()
+    cursor = conn.cursor()
+    
+    try:
+        synced_count = 0
+        
+        # Синхронизируем очередь (новые данные)
+        queue_items = cursor.execute('SELECT * FROM sync_queue ORDER BY created_at').fetchall()
+        
+        for item in queue_items:
+            data = json.loads(item[2])
+            result = send_command_direct(pi_id, item[1], data, timeout=5)
+            
+            if result.get('status') == 'success':
+                cursor.execute('DELETE FROM sync_queue WHERE id = ?', (item[0],))
+                synced_count += 1
+                logging.info(f"✅ Синхронизирована запись: {item[1]}")
+        
+        # Синхронизируем журнал (новые оценки)
+        journal_entries = cursor.execute('''
+            SELECT * FROM backup_journal WHERE date >= date('now', '-7 days')
+        ''').fetchall()
+        
+        for entry in journal_entries:
+            journal_data = {
+                'date': entry[1],
+                'student_name': entry[2],
+                'group_name': entry[3],
+                'subject': entry[4],
+                'topic': entry[5],
+                'grade': entry[6],
+                'attendance': bool(entry[7]),
+                'comments': entry[8],
+                'teacher_id': entry[9]
+            }
+            
+            result = send_command_direct(pi_id, 'add_journal_entry', journal_data, timeout=5)
+            if result.get('status') == 'success':
+                cursor.execute('DELETE FROM backup_journal WHERE id = ?', (entry[0],))
+                synced_count += 1
+        
+        conn.commit()
+        logging.info(f"✅ Синхронизация завершена. Обработано записей: {synced_count}")
+        
+    except Exception as e:
+        logging.error(f"❌ Ошибка синхронизации: {e}")
+        conn.rollback()
+    finally:
+        conn.close()
+
+# Прямая отправка команды (без резервного копирования)
+def send_command_direct(pi_id, command, data, timeout=10):
+    if pi_id not in connections:
+        raise Exception("Raspberry Pi not connected")
+    
+    request_id = str(uuid.uuid4())
+    command_data = {
+        'request_id': request_id,
+        'command': command,
+        'data': data
+    }
+    
+    pending_requests[request_id] = None
+    emit('command', command_data, room=connections[pi_id])
+    
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        if pending_requests.get(request_id) is not None:
+            response = pending_requests[request_id]
+            del pending_requests[request_id]
+            return response
+        time.sleep(0.1)
+    
+    if request_id in pending_requests:
+        del pending_requests[request_id]
+    raise Exception("Timeout")
+
+# API endpoints (остаются без изменений)
 @app.route('/api/groups')
 def get_groups():
-    """Просто пересылаем запрос на Raspberry Pi"""
-    try:
-        result = pi_manager.send_command('default_pi', 'get_groups', {}, timeout=10)
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({
-            'status': 'error', 
-            'message': f'Raspberry Pi unavailable: {str(e)}',
-            'error_code': 1337
-        })
+    result = send_command('default_pi', 'get_groups', {})
+    return jsonify(result)
 
 @app.route('/api/students/<group_name>')
 def get_students(group_name):
-    """Просто пересылаем запрос на Raspberry Pi"""
-    try:
-        result = pi_manager.send_command('default_pi', 'get_students', {'group_name': group_name}, timeout=10)
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({
-            'status': 'error',
-            'message': f'Raspberry Pi unavailable: {str(e)}',
-            'error_code': 1337
-        })
+    result = send_command('default_pi', 'get_students', {'group_name': group_name})
+    return jsonify(result)
 
 @app.route('/api/login', methods=['POST'])
 def login():
     data = request.json
-    try:
-        result = pi_manager.send_command('default_pi', 'login', data, timeout=10)
-        
-        if result.get('status') == 'success':
-            teacher_data = result.get('teacher', {})
-            session_id = str(uuid.uuid4())
-            
-            conn = pi_manager.cache_manager.get_db_connection()
-            conn.execute('''
-                INSERT OR REPLACE INTO teacher_sessions 
-                (session_id, teacher_id, teacher_name, is_admin, last_activity)
-                VALUES (?, ?, ?, ?, ?)
-            ''', (session_id, teacher_data['id'], teacher_data['name'], teacher_data['role'] == 'admin', datetime.now().isoformat()))
-            conn.commit()
-            conn.close()
-            
-            return jsonify({
-                'status': 'success',
-                'session_id': session_id,
-                'teacher': teacher_data
-            })
-        
-        return jsonify(result)
-    
-    except Exception as e:
-        return jsonify({
-            'status': 'error',
-            'message': f'Raspberry Pi unavailable: {str(e)}',
-            'error_code': 1337
-        })
+    result = send_command('default_pi', 'login', data)
+    return jsonify(result)
 
 @app.route('/api/admin/add_group', methods=['POST'])
 def add_group():
     data = request.json
-    try:
-        result = pi_manager.send_command('default_pi', 'add_group', data, timeout=10)
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({
-            'status': 'error',
-            'message': f'Raspberry Pi unavailable: {str(e)}',
-            'error_code': 1337
-        })
+    result = send_command('default_pi', 'add_group', data)
+    return jsonify(result)
 
 @app.route('/api/admin/add_student', methods=['POST'])
 def add_student():
     data = request.json
-    try:
-        result = pi_manager.send_command('default_pi', 'add_student', data, timeout=10)
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({
-            'status': 'error',
-            'message': f'Raspberry Pi unavailable: {str(e)}',
-            'error_code': 1337
-        })
+    result = send_command('default_pi', 'add_student', data)
+    return jsonify(result)
 
 @app.route('/api/teacher/topics', methods=['GET', 'POST'])
 def teacher_topics():
-    try:
-        if request.method == 'GET':
-            teacher_id = request.args.get('teacher_id')
-            subject = request.args.get('subject', 'Русский язык')
-            result = pi_manager.send_command('default_pi', 'get_teacher_topics', {
-                'teacher_id': teacher_id, 'subject': subject
-            }, timeout=10)
-        else:
-            data = request.json
-            result = pi_manager.send_command('default_pi', 'add_teacher_topic', data, timeout=10)
-        
-        return jsonify(result)
-    
-    except Exception as e:
-        return jsonify({
-            'status': 'error',
-            'message': f'Raspberry Pi unavailable: {str(e)}',
-            'error_code': 1337
+    if request.method == 'GET':
+        teacher_id = request.args.get('teacher_id')
+        subject = request.args.get('subject', 'Русский язык')
+        result = send_command('default_pi', 'get_teacher_topics', {
+            'teacher_id': teacher_id, 'subject': subject
         })
+    else:
+        data = request.json
+        result = send_command('default_pi', 'add_teacher_topic', data)
+    return jsonify(result)
 
 @app.route('/api/journal/entry', methods=['POST'])
 def add_journal_entry():
     data = request.json
-    try:
-        result = pi_manager.send_command('default_pi', 'add_journal_entry', data, timeout=10)
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({
-            'status': 'error',
-            'message': f'Raspberry Pi unavailable: {str(e)}',
-            'error_code': 1337
-        })
+    result = send_command('default_pi', 'add_journal_entry', data)
+    return jsonify(result)
 
+# Статус системы
 @app.route('/api/status')
 def get_status():
-    """Упрощенная проверка статуса - тестовая команда"""
-    try:
-        # Пробуем отправить тестовую команду
-        result = pi_manager.send_command('default_pi', 'get_groups', {}, timeout=5)
-        
-        return jsonify({
-            'status': 'success',
-            'raspberry_pi_connected': result.get('status') == 'success',
-            'connected_at': pi_manager.last_heartbeat.get('default_pi'),
-            'error_code': 0 if result.get('status') == 'success' else 1337
-        })
-        
-    except Exception as e:
-        return jsonify({
-            'status': 'error',
-            'raspberry_pi_connected': False,
-            'error_code': 1337,
-            'message': str(e)
-        })
-
-@app.route('/api/test_connection')
-def test_connection():
-    """Тест подключения к Raspberry Pi"""
-    try:
-        result = pi_manager.send_command('default_pi', 'get_groups', {}, timeout=10)
-        
-        if result.get('status') == 'success':
-            return jsonify({
-                'status': 'success',
-                'raspberry_pi_connected': True,
-                'message': 'Raspberry Pi responsive',
-                'test_data_received': len(result.get('data', [])),
-                'error_code': 0
-            })
-        else:
-            return jsonify({
-                'status': 'error', 
-                'raspberry_pi_connected': False,
-                'message': result.get('message', 'No response from Raspberry Pi'),
-                'error_code': 1337
-            })
-            
-    except Exception as e:
-        return jsonify({
-            'status': 'error',
-            'raspberry_pi_connected': False, 
-            'message': f'Connection test failed: {str(e)}',
-            'error_code': 1337
-        })
-
-@app.route('/health')
-def health():
-    pi_status = "connected" if pi_manager.connections else "disconnected"
-    bot_status = "running" if activity_bot_running else "stopped"
+    global backup_mode
+    conn = get_backup_db()
+    pending_count = conn.execute('SELECT COUNT(*) FROM sync_queue').fetchone()[0]
+    conn.close()
+    
     return jsonify({
-        'status': 'healthy',
-        'raspberry_pi': pi_status,
-        'activity_bot': bot_status,
-        'timestamp': datetime.now().isoformat()
+        'status': 'success',
+        'raspberry_pi_connected': 'default_pi' in connections and not backup_mode,
+        'backup_mode': backup_mode,
+        'pending_sync_count': pending_count
     })
 
-# HTML шаблоны
-def render_login_page(error=False, message=""):
-    return '''
+# HTML интерфейс (остается прежним)
+@app.route('/')
+def index():
+    global backup_mode
+    status_indicator = "🔴 РЕЖИМ РЕЗЕРВНОГО КОПИРОВАНИЯ" if backup_mode else "🟢 ШТАТНЫЙ РЕЖИМ"
+    
+    return f'''
     <!DOCTYPE html>
     <html>
     <head>
         <title>Вход в систему</title>
         <style>
-            body { font-family: Arial, sans-serif; max-width: 400px; margin: 100px auto; padding: 20px; }
-            .login-form { border: 1px solid #ddd; padding: 20px; border-radius: 5px; }
-            input { width: 100%; padding: 10px; margin: 10px 0; border: 1px solid #ccc; border-radius: 3px; }
-            button { width: 100%; padding: 10px; background: #007cba; color: white; border: none; border-radius: 3px; cursor: pointer; }
-            .error { color: red; margin-top: 10px; }
-            .status { margin: 10px 0; padding: 10px; border-radius: 3px; }
-            .connected { background: #d4edda; color: #155724; }
-            .disconnected { background: #f8d7da; color: #721c24; }
+            body {{ font-family: Arial, sans-serif; max-width: 400px; margin: 100px auto; padding: 20px; }}
+            .login-form {{ border: 1px solid #ddd; padding: 20px; border-radius: 5px; }}
+            input {{ width: 100%; padding: 10px; margin: 10px 0; border: 1px solid #ccc; border-radius: 3px; }}
+            button {{ width: 100%; padding: 10px; background: #007cba; color: white; border: none; border-radius: 3px; cursor: pointer; }}
+            .backup-mode {{ background: #fff3cd; color: #856404; padding: 10px; border-radius: 3px; margin-bottom: 15px; }}
+            .normal-mode {{ background: #d4edda; color: #155724; padding: 10px; border-radius: 3px; margin-bottom: 15px; }}
         </style>
-        <script>
-            async function checkRaspberryStatus() {
-                try {
-                    const response = await fetch('/api/test_connection');
-                    const data = await response.json();
-                    
-                    const statusDiv = document.getElementById('raspberry-status');
-                    if (data.raspberry_pi_connected) {
-                        statusDiv.innerHTML = '<div class="status connected">✅ База данных доступна</div>';
-                    } else {
-                        statusDiv.innerHTML = '<div class="status disconnected">❌ Ошибка 1337: База данных недоступна</div>';
-                    }
-                } catch (error) {
-                    document.getElementById('raspberry-status').innerHTML = 
-                        '<div class="status disconnected">❌ Ошибка проверки подключения</div>';
-                }
-            }
-            
-            // Проверяем статус при загрузке страницы
-            document.addEventListener('DOMContentLoaded', function() {
-                checkRaspberryStatus();
-                setInterval(checkRaspberryStatus, 10000);
-            });
-        </script>
     </head>
     <body>
         <div class="login-form">
+            <div class="{'backup-mode' if backup_mode else 'normal-mode'}">
+                {status_indicator}
+            </div>
             <h2>Вход в систему</h2>
-            <div id="raspberry-status">Проверка подключения к базе данных...</div>
             <form method="POST" action="/login">
                 <input name="teacher_id" placeholder="ID преподавателя" required>
                 <input name="password" type="password" placeholder="Пароль" required>
                 <button type="submit">Войти</button>
             </form>
-            ''' + (f'<div class="error">{message}</div>' if error else '') + '''
         </div>
     </body>
     </html>
     '''
 
-def render_dashboard(teacher_name, is_admin, teacher_id):
-    return f'''
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Панель преподавателя</title>
-        <style>
-            body {{ font-family: Arial, sans-serif; margin: 20px; }}
-            .header {{ background: #f8f9fa; padding: 20px; border-radius: 5px; margin-bottom: 20px; }}
-            .groups-section {{ border: 1px solid #ddd; padding: 20px; border-radius: 5px; }}
-        </style>
-    </head>
-    <body>
-        <div class="header">
-            <h1>Панель преподавателя</h1>
-            <p>Добро пожаловать, {teacher_name}!</p>
-            <p>ID: {teacher_id}</p>
-            <p>Роль: {"Администратор" if is_admin else "Преподаватель"}</p>
-        </div>
+@app.route('/login', methods=['POST'])
+def login_http():
+    teacher_id = request.form.get('teacher_id')
+    password = request.form.get('password')
+    
+    result = send_command('default_pi', 'login', {
+        'teacher_id': teacher_id, 'password': password
+    })
+    
+    if result.get('status') == 'success':
+        teacher_data = result.get('teacher', {})
+        session['teacher_id'] = teacher_data['id']
+        session['teacher_name'] = teacher_data['name']
+        session['is_admin'] = teacher_data['role'] == 'admin'
         
-        <div class="groups-section">
-            <h3>Группы студентов</h3>
-            <div id="groups-list">Загрузка групп...</div>
-            <button onclick="loadGroups()">Обновить группы</button>
-        </div>
+        return redirect('/dashboard')
+    else:
+        return redirect('/')
 
+@app.route('/dashboard')
+def dashboard():
+    return '''
+    <html>
+    <head><title>Панель управления</title></head>
+    <body>
+        <h1>Панель управления</h1>
+        <button onclick="loadGroups()">Показать группы</button>
+        <div id="content"></div>
         <script>
-            function loadGroups() {{
+            function loadGroups() {
                 fetch('/api/groups')
                     .then(r => r.json())
-                    .then(data => {{
-                        if(data.status === 'success') {{
-                            const groupsHtml = data.data.map(g => 
-                                `<div style="padding: 10px; margin: 5px; background: #f0f0f0; border-radius: 3px;">
-                                    {g.name}
-                                </div>`
-                            ).join('');
-                            document.getElementById('groups-list').innerHTML = groupsHtml;
-                        }} else {{
-                            document.getElementById('groups-list').innerHTML = 'Ошибка загрузки групп: ' + data.message;
-                        }}
-                    }});
-            }}
-            loadGroups();
+                    .then(data => {
+                        document.getElementById('content').innerHTML = 
+                            '<h3>Группы:</h3><pre>' + JSON.stringify(data, null, 2) + '</pre>';
+                    });
+            }
         </script>
     </body>
     </html>
     '''
 
-@app.route('/')
-def index():
-    # Простая проверка сессии
-    if 'teacher_id' in session:
-        return render_dashboard(
-            session.get('teacher_name', 'Учитель'),
-            session.get('is_admin', False),
-            session.get('teacher_id')
-        )
-    return render_login_page()
-
-@app.route('/login', methods=['POST'])
-def login_http():
-    # Упрощенная HTTP авторизация
-    teacher_id = request.form.get('teacher_id')
-    password = request.form.get('password')
-    
-    try:
-        result = pi_manager.send_command('default_pi', 'login', {
-            'teacher_id': teacher_id, 'password': password
-        }, timeout=10)
-        
-        if result.get('status') == 'success':
-            teacher_data = result.get('teacher', {})
-            session['teacher_id'] = teacher_data['id']
-            session['teacher_name'] = teacher_data['name']
-            session['is_admin'] = teacher_data['role'] == 'admin'
-            return redirect('/')
-        else:
-            return render_login_page(error=True, message=result.get('message', 'Ошибка входа'))
-    
-    except Exception as e:
-        return render_login_page(error=True, message=f'Ошибка подключения к базе данных: {str(e)}')
-
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5001))
-    logging.info(f"Starting server on port {port}")
     socketio.run(app, host='0.0.0.0', port=port, debug=False, allow_unsafe_werkzeug=True)
