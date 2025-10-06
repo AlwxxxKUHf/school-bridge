@@ -266,7 +266,13 @@ def handle_raspberry_connect(data):
         activity_bot.start()
         activity_bot_running = True
     
-    return {'status': 'connected'}
+    # ✅ ИСПРАВЛЕНИЕ: Возвращаем подтверждение подключения
+    return {
+        'status': 'success', 
+        'connected_at': time.time(),
+        'raspberry_pi_connected': True,
+        'message': f'Raspberry Pi {pi_id} connected successfully'
+    }
 
 @socketio.on('raspberry_response')
 def handle_raspberry_response(data):
